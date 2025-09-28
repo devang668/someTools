@@ -1,0 +1,297 @@
+# **************************************************train.py*******************
+
+import numpy as np
+import torch
+import matplotlib.pyplot as plt
+from ddpg_agent import DDPGAgent
+from wireless_env import WirelessCommEnv
+
+# ----------------------
+# 超参数配置
+# ----------------------
+EPISODES = 1000          # 总训练轮数
+MAX_STEPS = 200          # 每轮最大步数
+MAX_USERS = 50           # 最大用户数量
+MIN_USERS = 10           # 最小用户数量
+STATE_DIM_PER_USER = 4   # 每个用户的状态维度
+ACTION_DIM_PER_USER = 2  # 每个用户的动作维度
+
+# ----------------------
+# 环境初始化
+# ----------------------
+env = WirelessCommEnv(max_users=MAX_USERS)  # 固定最大用户数
+
+# ----------------------
+# 智能体初始化
+# ----------------------
+agent = DDPGAgent(
+    state_dim=STATE_DIM_PER_USER * MAX_USERS,  # 输入维度固定
+    action_dim=ACTION_DIM_PER_USER * MAX_USERS  # 输出维度固定
+)
+
+# ----------------------
+# 训练记录
+# ----------------------
+episode_rewards = []
+user_counts = []
+
+# ----------------------
+# 主训练循环
+# ----------------------
+for episode in range(EPISODES):
+    # 动态调整用户数量（每10轮变化）
+    if episode % 10 == 0:
+        new_num_users = np.random.randint(MIN_USERS, MAX_USERS+1)
+        env.current_num_users = new_num_users
+    
+    # 环境重置（返回填充后的完整状态）
+    state = env.reset()
+    total_reward = 0
+    
+    for step in range(MAX_STEPS):
+        # ----------------------
+        # 动作选择（直接使用完整状态）
+        # ----------------------
+        action = agent.select_action(state)  # 输入维度STATE_DIM_PER_USER*MAX_USERS
+        
+        # ----------------------
+        # 与环境交互
+        # ----------------------
+        next_state, reward, done, _ = env.step(action)
+        
+        # ----------------------
+        # 经验存储与学习
+        # ----------------------
+        agent.save_experience(state, action, reward, next_state)
+        agent.update()
+        
+        # ----------------------
+        # 状态转移与奖励累计
+        # ----------------------
+        state = next_state
+        total_reward += reward
+    
+    # ----------------------
+    # 记录训练指标
+    # ----------------------
+    episode_rewards.append(total_reward)
+    user_counts.append(env.current_num_users)
+    
+    # 打印训练进度
+    if episode % 50 == 0:
+        avg_reward = total_reward / MAX_STEPS
+        print(f"Episode {episode} | Users: {env.current_num_users} | "
+              f"Total Reward: {total_reward:.1f} | Avg Reward: {avg_reward:.2f}")
+
+# ----------------------
+# 模型保存与可视化
+# ----------------------
+torch.save(agent.actor.state_dict(), "ddpg_actor.pth")
+torch.save(agent.critic.state_dict(), "ddpg_critic.pth")
+
+plt.figure(figsize=(12,5))
+plt.subplot(1,2,1)
+plt.plot(episode_rewards)
+plt.title("Training Rewards")
+plt.subplot(1,2,2)
+plt.hist(user_counts, bins=MAX_USERS-MIN_USERS+1)
+plt.title("User Count Distribution")
+plt.tight_layout()
+plt.savefig("training_results.png")
+plt.show()
+# --------------------------------------------------------------------------------
+
+#*************************************  wireless_env.py  ********************
+
+
+import gym
+from gym import spaces
+import numpy as np
+
+class WirelessCommEnv(gym.Env):
+    def __init__(self, max_users=50):  # 明确定义max_users参数
+        super(WirelessCommEnv, self).__init__()
+        
+        # 核心参数
+        self.max_users = max_users
+        self.current_num_users = 10
+        
+        # 定义观测空间和动作空间（固定最大维度）
+        self.observation_space = spaces.Box(
+            low=0,
+            high=1,
+            shape=(4 * self.max_users,),  # 每个用户4个状态维度
+            dtype=np.float32
+        )
+        self.action_space = spaces.Box(
+            low=0,
+            high=1,
+            shape=(2 * self.max_users,),  # 每个用户2个动作维度
+            dtype=np.float32
+        )
+        
+        # 物理层参数
+        self.max_power = 20      # 最大发射功率（瓦）
+        self.bandwidth = 180e3   # 每个RB带宽（Hz）
+        self.path_loss_coeff = 34.5  # 3GPP UMi路径损耗系数
+        self.shadowing_std = 8       # 阴影衰落标准差（dB）
+    
+    def reset(self):
+        # 随机生成当前用户数（根据训练设置）
+        self.user_positions = np.random.uniform(50, 500, self.current_num_users)
+        self.qos_demand = np.random.randint(1, 5, self.current_num_users)
+        
+        # 生成有效状态并填充
+        valid_state = self._get_actual_state()
+        padded_state = np.zeros(4 * self.max_users)
+        padded_state[:4*self.current_num_users] = valid_state
+        return padded_state
+    
+    def _get_actual_state(self):
+        """生成实际用户数对应的状态（未填充）"""
+        csi = 10**(- (self.path_loss_coeff + 20*np.log10(self.user_positions)) / 20 )
+        return np.concatenate([
+            csi,
+            self.qos_demand / 5.0,
+            np.random.uniform(0, 1, self.current_num_users),  # 基站负载
+            np.random.uniform(0, 0.2, self.current_num_users) # 干扰水平
+        ])
+    
+    def step(self, action):
+        # 截取有效动作部分
+        valid_action = action[:2*self.current_num_users]
+        rb_alloc = valid_action[:self.current_num_users]
+        power_alloc = valid_action[self.current_num_users:] * self.max_power
+        
+        # 计算吞吐量（简化模型）
+        sinr = (power_alloc * 10**(- (self.path_loss_coeff + 20*np.log10(self.user_positions))/20 )) / 1e-9
+        throughput = self.bandwidth * np.log2(1 + sinr) / 1e6  # Mbps
+        
+        # 奖励函数
+        jain_index = np.sum(throughput)**2 / (self.current_num_users * np.sum(throughput**2))
+        reward = 0.7*np.sum(throughput) + 0.2*jain_index - 0.1*np.sum(power_alloc)
+        
+        # 生成新状态
+        next_state = self.reset()
+        
+        return next_state, reward, False, {}
+		
+		
+# ******************************************************************		
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+@author: 'Guohan'
+@file: ddpg_agent.py
+@time: 27/5/2025 上午 12:49
+@functions：please note ..
+"""
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import numpy as np
+import random
+from collections import deque
+
+
+# Actor网络定义
+class Actor(nn.Module):
+    def __init__(self, state_dim, action_dim, hidden_dim=256):
+        super(Actor, self).__init__()
+        self.net = nn.Sequential(
+            nn.Linear(state_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 128),
+            nn.ReLU(),
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Linear(64, action_dim),
+            nn.Sigmoid()  # 输出归一化到[0,1]
+        )
+
+    def forward(self, state):
+        return self.net(state)
+
+
+# Critic网络定义
+class Critic(nn.Module):
+    def __init__(self, state_dim, action_dim, hidden_dim=256):
+        super(Critic, self).__init__()
+        self.net = nn.Sequential(
+            nn.Linear(state_dim + action_dim, hidden_dim),
+            nn.LeakyReLU(),
+            nn.Linear(hidden_dim, 128),
+            nn.LeakyReLU(),
+            nn.Linear(128, 64),
+            nn.LeakyReLU(),
+            nn.Linear(64, 1)
+        )
+
+    def forward(self, state, action):
+        return self.net(torch.cat([state, action], 1))
+
+
+# DDPG Agent类
+class DDPGAgent:
+    def __init__(self, state_dim, action_dim):
+        self.actor = Actor(state_dim, action_dim)
+        self.actor_target = Actor(state_dim, action_dim)
+        self.actor_target.load_state_dict(self.actor.state_dict())
+        self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=1e-4)
+
+        self.critic = Critic(state_dim, action_dim)
+        self.critic_target = Critic(state_dim, action_dim)
+        self.critic_target.load_state_dict(self.critic.state_dict())
+        self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=1e-3)
+
+        self.replay_buffer = deque(maxlen=1000000)
+        self.batch_size = 64
+        self.tau = 0.005
+        self.gamma = 0.99
+
+    def select_action(self, state, noise_scale=0.1):
+        state = torch.FloatTensor(state).unsqueeze(0)
+        action = self.actor(state).detach().numpy()[0]
+        # 添加OU噪声促进探索
+        noise = noise_scale * np.random.randn(*action.shape)
+        return np.clip(action + noise, 0, 1)
+
+    def update(self):
+        if len(self.replay_buffer) < self.batch_size:
+            return
+
+        # 从回放缓冲区采样
+        batch = random.sample(self.replay_buffer, self.batch_size)
+        states = torch.FloatTensor([t[0] for t in batch])
+        actions = torch.FloatTensor([t[1] for t in batch])
+        rewards = torch.FloatTensor([t[2] for t in batch]).unsqueeze(1)
+        next_states = torch.FloatTensor([t[3] for t in batch])
+
+        # Critic更新
+        with torch.no_grad():
+            target_actions = self.actor_target(next_states)
+            target_q = self.critic_target(next_states, target_actions)
+            target_q = rewards + self.gamma * target_q
+
+        current_q = self.critic(states, actions)
+        critic_loss = nn.MSELoss()(current_q, target_q)
+
+        self.critic_optimizer.zero_grad()
+        critic_loss.backward()
+        self.critic_optimizer.step()
+
+        # Actor更新
+        actor_loss = -self.critic(states, self.actor(states)).mean()
+
+        self.actor_optimizer.zero_grad()
+        actor_loss.backward()
+        self.actor_optimizer.step()
+
+        # 软更新目标网络
+        for param, target_param in zip(self.actor.parameters(), self.actor_target.parameters()):
+            target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
+        for param, target_param in zip(self.critic.parameters(), self.critic_target.parameters()):
+            target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
+
+    def save_experience(self, state, action, reward, next_state):
+        self.replay_buffer.append((state, action, reward, next_state))
