@@ -1,0 +1,10 @@
+更好地实现git 推送
+
+启动后只有一个提示：
+Enter path or URL (or "exit"): 
+  如果输入以http开头 → 自动git clone，clone 完后立即 chdir 进刚生成的目录；
+如果输入是本地路径（如C:\Users\xxx\repo或/home/xxx/repo）→ 先chdir进去，再检查.git：
+    有 → 进入命令菜单，所有后续 Git 操作都在该目录执行；
+    没有 → 打印Not a git repo，回到第1步等待重新输入；
+在菜单里随时可以通过7) change path/URL回到第1步重新选择；
+任何地方输入exit立即退出程序。
